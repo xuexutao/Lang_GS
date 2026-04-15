@@ -14,6 +14,7 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from typing import Optional
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
@@ -55,32 +56,40 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+        # Lazy mmap cache for language features (avoid per-iter disk IO + meshgrid overhead).
+        self._lf_cached_dir: Optional[str] = None
+        self._lf_seg_mmap = None
+        self._lf_feat_mmap = None
+        self._lf_feat_gpu = None
+
     def get_language_feature(self, language_feature_dir, feature_level):
         language_feature_name = os.path.join(language_feature_dir, self.image_name)
-        seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy'))
-        feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))
-        
-        y, x = torch.meshgrid(torch.arange(0, self.image_height), torch.arange(0, self.image_width))
-        x = x.reshape(-1, 1)
-        y = y.reshape(-1, 1)
-        seg = seg_map[:, y, x].squeeze(-1).long()
-        mask = seg != -1
-        if feature_level == 0: # default
-            point_feature1 = feature_map[seg[0:1]].squeeze(0)
-            mask = mask[0:1].reshape(1, self.image_height, self.image_width)
-        elif feature_level == 1: # s
-            point_feature1 = feature_map[seg[1:2]].squeeze(0)
-            mask = mask[1:2].reshape(1, self.image_height, self.image_width)
-        elif feature_level == 2: # m
-            point_feature1 = feature_map[seg[2:3]].squeeze(0)
-            mask = mask[2:3].reshape(1, self.image_height, self.image_width)
-        elif feature_level == 3: # l
-            point_feature1 = feature_map[seg[3:4]].squeeze(0)
-            mask = mask[3:4].reshape(1, self.image_height, self.image_width)
-        else:
+
+        # Cache mmap handles (memory friendly; lets OS page-cache do the work).
+        if self._lf_cached_dir != language_feature_dir or self._lf_seg_mmap is None or self._lf_feat_mmap is None:
+            self._lf_cached_dir = language_feature_dir
+            self._lf_seg_mmap = np.load(language_feature_name + '_s.npy', mmap_mode='r')
+            self._lf_feat_mmap = np.load(language_feature_name + '_f.npy', mmap_mode='r')
+            # feature_map is typically small; keep it on GPU for fast indexing.
+            self._lf_feat_gpu = torch.from_numpy(np.asarray(self._lf_feat_mmap)).to(self.data_device)
+
+        lvl = int(feature_level)
+        if lvl < 0 or lvl > 3:
             raise ValueError("feature_level=", feature_level)
-        point_feature = point_feature1.reshape(self.image_height, self.image_width, -1).permute(2, 0, 1)
-        return point_feature.cuda(), mask.cuda()
+
+        # seg_map: [4, H, W] (with -1 for invalid)
+        seg_lvl = torch.from_numpy(self._lf_seg_mmap[lvl]).to(self.data_device).long()
+        mask = (seg_lvl != -1).unsqueeze(0)
+        seg_safe = seg_lvl.clamp(min=0)
+
+        # feature_map: [num_segments, 512] -> gather to [H, W, 512]
+        point_feature = self._lf_feat_gpu[seg_safe]
+        point_feature = point_feature.permute(2, 0, 1).contiguous()
+
+        # Zero out invalid pixels to keep behavior consistent.
+        point_feature = point_feature * mask
+        return point_feature, mask
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
@@ -94,4 +103,3 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
-

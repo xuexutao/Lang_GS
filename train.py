@@ -25,6 +25,7 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.vq_utils import load_2d_language_feature, ResidualVectorQuantizationWithClustering
+import time
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -85,6 +86,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             region_masks = [gaussians.get_local_region_mask(rid) for rid in range(num_regions)]
             non_empty_region_ids = [rid for rid, m in enumerate(region_masks) if bool(m.any().item())]
 
+        # One-time performance hint for default settings.
+        if num_regions > 1 and int(getattr(opt, "local_region_sample_num", -1)) < 0 and int(getattr(opt, "local_render_interval", 1)) <= 1:
+            print(
+                f"[perf-hint] num_local_regions={num_regions} 且每次迭代都计算全部 local 分支，"
+                f"训练耗时通常会接近 (1+R) 倍。可尝试："
+                f"--local_region_sample_num 2 或 --local_render_interval 2 以显著降耗时。"
+            )
+
         
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -100,6 +109,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_record = []
     smooth_loss = None
     for iteration in range(first_iter, opt.iterations + 1):        
+        do_time_breakdown = bool(getattr(args, "time_breakdown", False))
+        time_every = int(getattr(args, "time_breakdown_every", 50))
+        time_first = int(getattr(args, "time_breakdown_first", 0))
+        profile_this_iter = do_time_breakdown and (iteration <= max(time_first, 0) or (time_every > 0 and iteration % time_every == 0))
+        if profile_this_iter:
+            torch.cuda.synchronize()
+            t_iter0 = time.perf_counter()
+            # Initialize timestamps to avoid UnboundLocalError in branches.
+            t_render = t_iter0
+            t_gt = t_iter0
+            t_global = t_iter0
+            t_local = t_iter0
+            t_bwd = t_iter0
+            t_opt = t_iter0
+
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -153,17 +177,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             render_pkg["visibility_filter"],
             render_pkg["radii"],
         )
+
+        if profile_this_iter:
+            torch.cuda.synchronize()
+            t_render = time.perf_counter()
         
         # Loss
         if opt.include_feature:
             # gt_language_feature [512 H W]
             gt_language_feature, language_feature_mask = viewpoint_cam.get_language_feature(language_feature_dir=dataset.lf_path, feature_level=dataset.feature_level)
+
+            if profile_this_iter:
+                torch.cuda.synchronize()
+                t_gt = time.perf_counter()
+
             # In this paper, we select layer_num = 1
             layer_num, _, _ = gaussians.get_language_feature_codebooks.shape
             layer_idx = min(int(iteration / 10000 * layer_num), layer_num - 1)
 
             # Global feature reconstruction (auto-slices packed map)
             global_feature = gaussians.compute_global_layer_feature_map(weight_map, layer_idx)
+
+            if profile_this_iter:
+                torch.cuda.synchronize()
+                t_global = time.perf_counter()
 
             # Local feature reconstruction (from packed map, no extra renders)
             alpha = float(getattr(opt, "global_local_alpha", 0.5))
@@ -177,31 +214,62 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if (not do_local) or (num_regions <= 1) or (getattr(gaussians, "_local_language_feature_codebooks", None) is None):
                 alpha_eff = 1.0
+                if profile_this_iter:
+                    t_local = t_global
             else:
                 # base_C inferred from global codebooks
                 layer_num, codebook_size, _ = gaussians.get_language_feature_codebooks.shape
                 base_C = int(layer_num * codebook_size)
-                # weight_map layout: [base_C + num_regions*base_C, H, W]
-                # choose subset of regions for compute to reduce Python overhead (optional)
-                if region_masks is None or non_empty_region_ids is None or len(non_empty_region_ids) == 0:
-                    chosen_rids = list(range(num_regions))
+                expected_C = base_C * (1 + int(num_regions))
+                chosen_rids = []
+                if int(weight_map.shape[0]) < expected_C:
+                    # Render did not output packed channels (e.g. rasterizer not compiled with PACKED).
+                    alpha_eff = 1.0
+                    if not hasattr(training, "_warned_packed_mismatch"):
+                        print(
+                            f"[warn] language_feature_weight_map 通道数={int(weight_map.shape[0])}，"
+                            f"不足以支持 packed local-global（期望 >= {expected_C}）。已退化为 global-only。"
+                        )
+                        training._warned_packed_mismatch = True
                 else:
-                    if sample_num == 0:
-                        alpha_eff = 1.0
-                        chosen_rids = []
-                    elif sample_num < 0 or sample_num >= len(non_empty_region_ids):
-                        chosen_rids = non_empty_region_ids
+                    # weight_map layout: [base_C + num_regions*base_C, H, W]
+                    # choose subset of regions for compute to reduce overhead (optional)
+                    if region_masks is None or non_empty_region_ids is None or len(non_empty_region_ids) == 0:
+                        chosen_rids = list(range(num_regions))
                     else:
-                        chosen_rids = random.sample(non_empty_region_ids, sample_num)
+                        if sample_num == 0:
+                            alpha_eff = 1.0
+                            chosen_rids = []
+                        elif sample_num < 0 or sample_num >= len(non_empty_region_ids):
+                            chosen_rids = non_empty_region_ids
+                        else:
+                            chosen_rids = random.sample(non_empty_region_ids, sample_num)
 
-                for rid in chosen_rids:
-                    start = base_C + int(rid) * base_C
-                    end = start + base_C
-                    local_slice = weight_map[start:end]
-                    local_feature = local_feature + gaussians.compute_local_layer_feature_map(local_slice, layer_idx, rid)
+                    # Fast path for the common setup: vq_layer_num == 1 (layer_num==1, layer_idx==0)
+                    if layer_num == 1 and layer_idx == 0 and len(chosen_rids) > 0:
+                        # [R, base_C, H, W] then pick chosen rids
+                        local_block = weight_map[base_C: base_C + int(num_regions) * base_C].view(int(num_regions), base_C, *weight_map.shape[1:])
+                        chosen_idx = torch.tensor(chosen_rids, device=weight_map.device, dtype=torch.long)
+                        local_sel = local_block[chosen_idx]
+                        w = local_sel.view(len(chosen_rids), base_C, -1)  # [M, K, HW]
 
-                if len(chosen_rids) > 0 and non_empty_region_ids is not None and len(chosen_rids) < len(non_empty_region_ids):
-                    local_feature = local_feature * (float(len(non_empty_region_ids)) / float(len(chosen_rids)))
+                        # codebooks: [M, K, 512]
+                        cb = gaussians._local_language_feature_codebooks[chosen_idx, 0]
+                        local_feat_batched = torch.bmm(cb.transpose(1, 2), w)  # [M, 512, HW]
+                        local_feature = local_feat_batched.sum(dim=0).view(512, *weight_map.shape[1:])
+                    else:
+                        for rid in chosen_rids:
+                            start = base_C + int(rid) * base_C
+                            end = start + base_C
+                            local_slice = weight_map[start:end]
+                            local_feature = local_feature + gaussians.compute_local_layer_feature_map(local_slice, layer_idx, rid)
+
+                    if len(chosen_rids) > 0 and non_empty_region_ids is not None and len(chosen_rids) < len(non_empty_region_ids):
+                        local_feature = local_feature * (float(len(non_empty_region_ids)) / float(len(chosen_rids)))
+
+            if profile_this_iter:
+                torch.cuda.synchronize()
+                t_local = time.perf_counter()
 
             language_feature = alpha_eff * global_feature + (1.0 - alpha_eff) * local_feature
             if args.normalize:
@@ -218,8 +286,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            if profile_this_iter:
+                torch.cuda.synchronize()
+                t_gt = t_render
+                t_global = t_render
+                t_local = time.perf_counter()
         loss.backward()
         iter_end.record()
+
+        if profile_this_iter:
+            torch.cuda.synchronize()
+            t_bwd = time.perf_counter()
         
         iter_record.append(iteration)
         if smooth_loss is None:
@@ -261,6 +338,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration < opt.iterations) and (iteration % args.accum_iter == 0):
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+
+            if profile_this_iter:
+                torch.cuda.synchronize()
+                t_opt = time.perf_counter()
+                wshape = tuple(weight_map.shape) if (opt.include_feature and isinstance(weight_map, torch.Tensor)) else None
+                msg = (
+                    f"[time] iter={iteration} "
+                    f"render={(t_render - t_iter0):.3f}s "
+                    f"gt={(t_gt - t_render):.3f}s "
+                    f"global={(t_global - t_gt):.3f}s "
+                    f"local={(t_local - t_global):.3f}s "
+                    f"bwd={(t_bwd - t_local):.3f}s "
+                    f"opt={(t_opt - t_bwd):.3f}s "
+                    f"total={(t_opt - t_iter0):.3f}s "
+                    f"weight_map_shape={wshape}"
+                )
+                print(msg)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -348,6 +442,10 @@ if __name__ == "__main__":
     parser.add_argument('--normalize', action='store_true', default=False)
     parser.add_argument('--accum_iter', type=int, default=1)
     parser.add_argument('--topk', type=int, default=1)
+    # Profiling helpers
+    parser.add_argument('--time_breakdown', action='store_true', default=False)
+    parser.add_argument('--time_breakdown_every', type=int, default=50, help='Print breakdown every N iters (<=0 disables periodic printing)')
+    parser.add_argument('--time_breakdown_first', type=int, default=0, help='Also print breakdown for first N iters (0 disables)')
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     print(args)

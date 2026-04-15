@@ -16,15 +16,15 @@
 
 ### 1.2 MVP 渲染取舍：local 采用“按 region 多次 render”
 
-原因：当前 rasterizer 的语言通道数与 `vq_layer_num * codebook_size` 强绑定（默认 64），不改 CUDA 无法直接把 `region` 维度拼进通道。
+原因：当前 rasterizer 的语言通道数与 `vq_layer_num * codebook_size` 强绑定（默认 64），单纯 Python 侧无法把 `region` 维度拼进一次 render 的输出。
 
-因此第一阶段采用：
+落地时做了两步取舍：
 
-- global：一次 render 得到 `global_weight_map`，再用 global codebook 重建
-- local：对每个 local region `rid` 取该 region 的 Gaussian 子集，**多次 render** 得到 `local_weight_map[rid]`，再用 `local_codebook[rid]` 重建并累加
-- 最后做 fused
+1) 最早的纯 Python MVP：local 走“按 region 多次 render”（易 debug，但耗时约随 `R=num_local_regions` 线性放大）。
 
-这符合 `fine_v1.md` “先跑通 Python 主链路、暂不改 CUDA quick path” 的策略。
+2) 为避免训练耗时爆炸，最终升级为 **CUDA packed 方案1**：一次 render 输出 packed weight map（`global + R*local`），Python 侧切片重建并融合。
+
+备注：`--quick_render` 路径仍保持 BASE 输出长度，不做 local-global 融合（见 2.6）。
 
 ---
 
@@ -87,9 +87,37 @@
   - local codebook：默认 `copy_global` 到每个 region（或 `random` 不处理）
 - `--topk` 兼容：若用户只提供 `--topk`，会自动同步到 `global_topk/local_topk`
 
+### 2.5 `scene/cameras.py`
+
+为减少训练每 iter 的额外开销，对 `Camera.get_language_feature(...)` 做了两点优化：
+
+- 使用 `np.load(..., mmap_mode='r')` 做懒加载 + OS page cache，避免每次完整读入 npy。
+- 去掉 `torch.meshgrid` 与大规模高级索引，改为直接用 `seg_map[level]` 在 GPU 上 gather 对应的 512 维特征。
+
+这不改变数值语义（仍对 `seg==-1` 的像素做 mask）。
+
 ### 2.5 `eval_lerf.py`
 
 - `render_language_feature_map(...)` 改为 fused feature map（一次 render 的 packed weight map 切片重建）
+
+### 2.7 性能与排查（训练变慢的常见原因）
+
+当启用 local-global（尤其是 packed 方案1）后，训练每 iter 变慢通常来自三部分叠加：
+
+- packed 渲染输出通道数从 `64` 变为 `64*(1+R)`，例如 `R=8` 时是 `576` 通道，rasterizer 前向/反向的带宽与写出显著增加。
+- local 重建在 Python 侧是按 region 做 `512×64 @ 64×(H·W)` 的矩阵乘，默认 `R=8` 会额外做 8 次。
+- GT language feature 如果每 iter 都从磁盘读取 npy，会产生明显 IO 抖动（已在 2.5 中优化）。
+
+为方便快速定位耗时热点，在 `train.py` 增加了可开关的分段计时：
+
+- `--time_breakdown`：开启分段计时打印
+- `--time_breakdown_first N`：前 N 次迭代都打印（用于 warmup/首屏定位）
+- `--time_breakdown_every N`：之后每 N 次迭代打印一次
+
+同时，针对 local 分支计算量，提供两组“降耗时旋钮”（无需 CUDA 改动）：
+
+- `--local_region_sample_num K`：每次只计算 K 个非空 region（并做期望尺度修正），推荐从 `K=2` 起。
+- `--local_render_interval N`：每 N 次迭代才计算一次 local，其余迭代退化为 global-only（`alpha_eff=1.0`），推荐从 `N=2/4` 起。
 
 ### 2.6 CUDA 方案1（关键提速改动）
 
@@ -118,6 +146,7 @@
   - `gaussian_renderer/__init__.py`
   - `arguments/__init__.py`
   - `train.py`
+  - `scene/cameras.py`
   - `eval_lerf.py`
 - 由于当前机器缺少 CUDA（`CUDA_HOME` 未配置），`diff_gaussian_rasterization` 的 `_C` 扩展无法在此环境编译，因此无法在本机完成端到端渲染训练/评估跑通。
 
@@ -126,6 +155,33 @@
 ## 4. 使用说明（建议）
 
 在具备可用 CUDA + 已编译 rasterizer 的环境下：
+
+### 4.1 编译扩展（必须）
+
+在你的 Python/conda 环境中（保证 `torch` 是 CUDA 版本，且 `nvcc` 可用）：
+
+- `pip install -v -e submodules/efficient-langsplat-rasterization`
+- `pip install -v -e submodules/simple-knn`
+
+快速自检：
+
+- `python -c "import diff_gaussian_rasterization, simple_knn; print('ext ok')"`
+
+### 4.2 训练（CUDA packed 方案1）
+
+关键约束：`--num_local_regions <= MAX_LOCAL_REGIONS`，默认 `MAX_LOCAL_REGIONS=8`。
+
+示例（单层 feature_level=1，带耗时分解与降耗时参数）：
+
+- `python train.py -s <DATASET_ROOT>/<SCENE> -m output/<SCENE>_<IDX> --start_checkpoint <RGB_CKPT> --feature_level 1 --vq_layer_num 1 --codebook_size 64 --cos_loss --global_topk 4 --local_topk 4 --num_local_regions 8 --global_local_alpha 0.5 --local_region_mode grid --local_codebook_init_mode copy_global --time_breakdown --time_breakdown_first 5 --time_breakdown_every 50 --local_region_sample_num 2 --local_render_interval 1`
+
+三层训练可直接复用 `train.sh`，只需追加 local-global 参数即可。we
+
+### 4.3 LERF 评估
+
+第一阶段建议先不用 `--quick_render`（quick 路径尚未做 local-global 融合）。
+
+- `python eval_lerf.py -s <DATASET_ROOT>/lerf_ovs/<SCENE> -m output/<SCENE>_<IDX>_1 --dataset_name <SCENE> --index <IDX> --ckpt_root_path ./output --output_dir ./eval_result --mask_thresh 0.4 --json_folder <GT_LABEL_ROOT> --checkpoint 10000 --include_feature --global_topk 4 --local_topk 4 --num_local_regions 8 --global_local_alpha 0.5`
 
 - 训练（feature 训练，基于已有 checkpoint 的流程不变）：
   - 通过参数控制：`--num_local_regions`、`--global_local_alpha`、`--global_topk`、`--local_topk`
