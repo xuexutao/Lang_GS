@@ -17,7 +17,10 @@ import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
+try:
+    from simple_knn._C import distCUDA2
+except Exception:
+    distCUDA2 = None
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.vq_utils import softmax_to_topk_soft_code
@@ -51,10 +54,20 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        # NOTE: legacy single-branch language field (kept for backward compatibility)
         self._language_feature_logits = None
         self._language_feature_codebooks = None
         self._language_feature_weights = None
         self._language_feature_indices = None
+
+        # Local-Global Sparse Language Field (MVP, Python main path)
+        self._global_language_feature_logits = None
+        self._global_language_feature_codebooks = None
+        self._local_language_feature_logits = None
+        # shape: [num_local_regions, vq_layer_num, local_codebook_size, 512]
+        self._local_language_feature_codebooks = None
+        # shape: [N] long, each gaussian's local region id
+        self._local_region_ids = None
         
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -66,6 +79,31 @@ class GaussianModel:
 
     def capture(self, include_feature=False):
         if include_feature:
+            # Prefer new local-global parameters if available; otherwise fallback to legacy.
+            if self._global_language_feature_logits is not None and self._global_language_feature_codebooks is not None:
+                assert self._local_language_feature_logits is not None, "local language feature logits is None"
+                assert self._local_language_feature_codebooks is not None, "local language feature codebooks is None"
+                assert self._local_region_ids is not None, "local region ids is None"
+                return (
+                    self.active_sh_degree,
+                    self._xyz,
+                    self._features_dc,
+                    self._features_rest,
+                    self._scaling,
+                    self._rotation,
+                    self._opacity,
+                    self._global_language_feature_logits,
+                    self._global_language_feature_codebooks,
+                    self._local_language_feature_logits,
+                    self._local_language_feature_codebooks,
+                    self._local_region_ids,
+                    self.max_radii2D,
+                    self.xyz_gradient_accum,
+                    self.denom,
+                    self.optimizer.state_dict(),
+                    self.spatial_lr_scale,
+                )
+
             assert self._language_feature_logits is not None, "language feature logits is None"
             assert self._language_feature_codebooks is not None, "language feature codebooks is None"
             return (
@@ -101,21 +139,61 @@ class GaussianModel:
             )            
     
     def restore(self, model_args, training_args, mode='train'):
+        # New local-global checkpoint format
+        if len(model_args) == 17:
+            (self.active_sh_degree,
+             self._xyz,
+             self._features_dc,
+             self._features_rest,
+             self._scaling,
+             self._rotation,
+             self._opacity,
+             self._global_language_feature_logits,
+             self._global_language_feature_codebooks,
+             self._local_language_feature_logits,
+             self._local_language_feature_codebooks,
+             self._local_region_ids,
+             self.max_radii2D,
+             xyz_gradient_accum,
+             denom,
+             opt_dict,
+             self.spatial_lr_scale) = model_args
+
+            # Backward-compatible aliases used by existing eval/quick code paths.
+            self._language_feature_logits = self._global_language_feature_logits
+            self._language_feature_codebooks = self._global_language_feature_codebooks
+
+            if mode == 'train':
+                self.training_setup(training_args)
+                self.xyz_gradient_accum = xyz_gradient_accum
+                self.denom = denom
+                if not training_args.include_feature:
+                    self.optimizer.load_state_dict(opt_dict)
+            return
+
+        # Legacy single-branch language checkpoint format
         if len(model_args) == 14: # for language feature
             (self.active_sh_degree, 
-            self._xyz, 
-            self._features_dc, 
-            self._features_rest,
-            self._scaling, 
-            self._rotation, 
-            self._opacity,
-            self._language_feature_logits,
-            self._language_feature_codebooks,
-            self.max_radii2D, 
-            xyz_gradient_accum, 
-            denom,
-            opt_dict, 
-            self.spatial_lr_scale) = model_args
+             self._xyz, 
+             self._features_dc, 
+             self._features_rest,
+             self._scaling, 
+             self._rotation, 
+             self._opacity,
+             self._language_feature_logits,
+             self._language_feature_codebooks,
+             self.max_radii2D, 
+             xyz_gradient_accum, 
+             denom,
+             opt_dict, 
+             self.spatial_lr_scale) = model_args
+
+            # Map legacy params to global branch for local-global code.
+            self._global_language_feature_logits = self._language_feature_logits
+            self._global_language_feature_codebooks = self._language_feature_codebooks
+            self._local_language_feature_logits = None
+            self._local_language_feature_codebooks = None
+            self._local_region_ids = None
         elif len(model_args) == 12:
             (self.active_sh_degree, 
             self._xyz, 
@@ -162,17 +240,65 @@ class GaussianModel:
     
     @property
     def get_language_feature_logits(self):
+        # Prefer global branch if present.
+        if self._global_language_feature_logits is not None:
+            return self._global_language_feature_logits
         if self._language_feature_logits is not None:
             return self._language_feature_logits
-        else:
-            raise ValueError('language feature logits is None')
+        raise ValueError('language feature logits is None')
     
     @property
     def get_language_feature_codebooks(self):
+        # Prefer global branch if present.
+        if self._global_language_feature_codebooks is not None:
+            return self._global_language_feature_codebooks
         if self._language_feature_codebooks is not None:
             return self._language_feature_codebooks
-        else:
-            raise ValueError('language feature codebooks is None')
+        raise ValueError('language feature codebooks is None')
+
+    def _infer_grid_divisions(self, num_local_regions: int):
+        """Return (nx, ny, nz) for grid mode.
+
+        If num_local_regions is a perfect cube, use (c, c, c). Otherwise fallback to 1D split (num, 1, 1).
+        """
+        c = int(round(num_local_regions ** (1.0 / 3.0)))
+        if c > 0 and c ** 3 == int(num_local_regions):
+            return c, c, c
+        return int(num_local_regions), 1, 1
+
+    def compute_local_region_ids(self, num_local_regions: int, mode: str = "grid"):
+        """Assign each gaussian to a local region id.
+
+        MVP implementation: spatial grid partition based on xyz bounding box.
+        - mode='grid': 3D uniform grid if num_local_regions is perfect cube, else 1D split along x.
+        """
+        if num_local_regions <= 1:
+            return torch.zeros((self.get_xyz.shape[0],), dtype=torch.long, device=self.get_xyz.device)
+
+        xyz = self.get_xyz.detach()
+        xyz_min = xyz.min(dim=0).values
+        xyz_max = xyz.max(dim=0).values
+        denom = (xyz_max - xyz_min).clamp_min(1e-6)
+        xyz01 = (xyz - xyz_min) / denom
+
+        if mode != "grid":
+            # fallback: 1D split along x
+            x = xyz01[:, 0]
+            rid = torch.floor(x * num_local_regions).long().clamp(0, num_local_regions - 1)
+            return rid
+
+        nx, ny, nz = self._infer_grid_divisions(num_local_regions)
+        ix = torch.floor(xyz01[:, 0] * nx).long().clamp(0, nx - 1)
+        iy = torch.floor(xyz01[:, 1] * ny).long().clamp(0, ny - 1)
+        iz = torch.floor(xyz01[:, 2] * nz).long().clamp(0, nz - 1)
+        rid = ix + nx * (iy + ny * iz)
+        rid = rid.clamp(0, num_local_regions - 1)
+        return rid
+
+    def get_local_region_mask(self, region_id: int):
+        if self._local_region_ids is None:
+            raise ValueError("local region ids is None")
+        return (self._local_region_ids == int(region_id))
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -191,7 +317,16 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        if distCUDA2 is None:
+            # Fallback (slow): pairwise distance on GPU/CPU if CUDA extension is unavailable.
+            pts = torch.from_numpy(np.asarray(pcd.points)).float().to(fused_point_cloud.device)
+            # cdist returns euclidean distance; we need squared distances.
+            d = torch.cdist(pts, pts)
+            # exclude self by setting diagonal to +inf
+            d.fill_diagonal_(float('inf'))
+            dist2 = torch.clamp_min((d.min(dim=1).values ** 2), 0.0000001)
+        else:
+            dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -215,16 +350,55 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         
         if training_args.include_feature:
-            if self._language_feature_logits is None or self._language_feature_logits.shape[0] != self._xyz.shape[0]:
-                # initialize language feature logits and codebooks
-                language_feature_logits = torch.zeros((self._xyz.shape[0], training_args.vq_layer_num * training_args.codebook_size), device="cuda")
-                language_feature_codebooks = torch.randn((training_args.vq_layer_num, training_args.codebook_size, 512), device="cuda")
-                self._language_feature_logits = nn.Parameter(language_feature_logits.requires_grad_(True))
-                self._language_feature_codebooks = nn.Parameter(language_feature_codebooks.requires_grad_(True))
-                
+            # NOTE: rasterizer language channel count is hard-coupled with codebook_size * vq_layer_num.
+            # MVP keeps the original channel count (default 64) to avoid CUDA changes.
+            global_codebook_size = int(getattr(training_args, "global_codebook_size", training_args.codebook_size))
+            local_codebook_size = int(getattr(training_args, "local_codebook_size", training_args.codebook_size))
+            num_local_regions = int(getattr(training_args, "num_local_regions", 1))
+            local_region_mode = str(getattr(training_args, "local_region_mode", "grid"))
+
+            if global_codebook_size != training_args.codebook_size or local_codebook_size != training_args.codebook_size:
+                raise ValueError(
+                    f"MVP does not support changing codebook sizes without CUDA changes: "
+                    f"global_codebook_size={global_codebook_size}, local_codebook_size={local_codebook_size}, "
+                    f"codebook_size={training_args.codebook_size}"
+                )
+
+            N = self._xyz.shape[0]
+            # Initialize global branch
+            if (self._global_language_feature_logits is None) or (self._global_language_feature_logits.shape[0] != N):
+                g_logits = torch.zeros((N, training_args.vq_layer_num * global_codebook_size), device="cuda")
+                g_codebooks = torch.randn((training_args.vq_layer_num, global_codebook_size, 512), device="cuda")
+                self._global_language_feature_logits = nn.Parameter(g_logits.requires_grad_(True))
+                self._global_language_feature_codebooks = nn.Parameter(g_codebooks.requires_grad_(True))
+
+            # Initialize local branch
+            if (self._local_language_feature_logits is None) or (self._local_language_feature_logits.shape[0] != N):
+                l_logits = torch.zeros((N, training_args.vq_layer_num * local_codebook_size), device="cuda")
+                l_codebooks = torch.randn((num_local_regions, training_args.vq_layer_num, local_codebook_size, 512), device="cuda")
+                self._local_language_feature_logits = nn.Parameter(l_logits.requires_grad_(True))
+                self._local_language_feature_codebooks = nn.Parameter(l_codebooks.requires_grad_(True))
+
+            # Assign local regions (non-trainable)
+            if (self._local_region_ids is None) or (self._local_region_ids.shape[0] != N):
+                with torch.no_grad():
+                    self._local_region_ids = self.compute_local_region_ids(num_local_regions, mode=local_region_mode)
+
+            # Backward-compatible aliases
+            self._language_feature_logits = self._global_language_feature_logits
+            self._language_feature_codebooks = self._global_language_feature_codebooks
+
             l = [
-                {'params': [self._language_feature_logits, self._language_feature_codebooks], 
-                 'lr': training_args.language_feature_lr, "name": "language_feature"},
+                {
+                    'params': [
+                        self._global_language_feature_logits,
+                        self._global_language_feature_codebooks,
+                        self._local_language_feature_logits,
+                        self._local_language_feature_codebooks,
+                    ],
+                    'lr': training_args.language_feature_lr,
+                    "name": "language_feature",
+                },
             ]
             self._xyz.requires_grad_(False)
             self._features_dc.requires_grad_(False)
@@ -241,6 +415,7 @@ class GaussianModel:
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             ]
+            # In non-feature training we don't optimize language fields.
             assert self._language_feature_logits is None and self._language_feature_codebooks is None
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -498,9 +673,18 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
     
-    def get_render_weights(self, k):
-        logits = self._language_feature_logits
-        layer_num, codebook_size, _ = self._language_feature_codebooks.shape
+    def get_render_weights(self, k, branch: str = "global"):
+        if branch == "local":
+            if self._local_language_feature_logits is None:
+                raise ValueError("local language feature logits is None")
+            if self._local_language_feature_codebooks is None:
+                raise ValueError("local language feature codebooks is None")
+            logits = self._local_language_feature_logits
+            _, layer_num, codebook_size, _ = self._local_language_feature_codebooks.shape
+        else:
+            # default: global
+            logits = self.get_language_feature_logits
+            layer_num, codebook_size, _ = self.get_language_feature_codebooks.shape
         weights = []
         for i in range(layer_num):
             soft_code = softmax_to_topk_soft_code(logits[:, i*codebook_size:(i+1)*codebook_size], k)
@@ -511,7 +695,7 @@ class GaussianModel:
         D, H, W = language_feature_weight_map.shape
         language_feature_weight_map = language_feature_weight_map.view(D, -1)
         language_features = []
-        layer_num, codebook_size, _ = self._language_feature_codebooks.shape
+        layer_num, codebook_size, _ = self.get_language_feature_codebooks.shape
         for i in range(layer_num):
             language_feature = self.get_language_feature_codebooks[i].T @ language_feature_weight_map[i * codebook_size:(i+1)*codebook_size]
             language_feature = language_feature.view(512, H, W)
@@ -520,10 +704,10 @@ class GaussianModel:
             language_features.append(language_feature)
         return torch.stack(language_features, dim=1)
 
-    def compute_layer_feature_map(self, language_feature_weight_map, layer_idx):
+    def compute_global_layer_feature_map(self, language_feature_weight_map, layer_idx):
         D, H, W = language_feature_weight_map.shape
         language_feature_weight_map = language_feature_weight_map.view(D, -1)
-        layer_num, codebook_size, _ = self._language_feature_codebooks.shape
+        layer_num, codebook_size, _ = self.get_language_feature_codebooks.shape
         for i in range(layer_idx + 1):
             language_feature = self.get_language_feature_codebooks[i].T @ language_feature_weight_map[i * codebook_size:(i+1)*codebook_size]
             language_feature = language_feature.view(512, H, W)
@@ -531,10 +715,44 @@ class GaussianModel:
                 language_feature += language_feature_before.detach()
             language_feature_before = language_feature
         return language_feature
-    
-    def compute_final_feature_map(self, language_feature_weight_map):
+
+    def compute_local_layer_feature_map(self, language_feature_weight_map, layer_idx, region_id: int):
+        if self._local_language_feature_codebooks is None:
+            raise ValueError("local language feature codebooks is None")
         D, H, W = language_feature_weight_map.shape
-        language_feature_weight_map = language_feature_weight_map.view(D, -1) 
+        language_feature_weight_map = language_feature_weight_map.view(D, -1)
+        # local_codebooks: [R, L, K, 512]
+        codebooks = self._local_language_feature_codebooks[int(region_id)]
+        layer_num, codebook_size, _ = codebooks.shape
+        for i in range(layer_idx + 1):
+            language_feature = codebooks[i].T @ language_feature_weight_map[i * codebook_size:(i+1)*codebook_size]
+            language_feature = language_feature.view(512, H, W)
+            if i > 0:
+                language_feature += language_feature_before.detach()
+            language_feature_before = language_feature
+        return language_feature
+
+    # Backward-compatible wrappers
+    def compute_layer_feature_map(self, language_feature_weight_map, layer_idx):
+        return self.compute_global_layer_feature_map(language_feature_weight_map, layer_idx)
+    
+    def compute_global_final_feature_map(self, language_feature_weight_map):
+        D, H, W = language_feature_weight_map.shape
+        language_feature_weight_map = language_feature_weight_map.view(D, -1)
         language_feature = self.get_language_feature_codebooks.view(-1, 512).T @ language_feature_weight_map
         language_feature = language_feature.view(512, H, W)
         return language_feature
+
+    def compute_local_final_feature_map(self, language_feature_weight_map, region_id: int):
+        if self._local_language_feature_codebooks is None:
+            raise ValueError("local language feature codebooks is None")
+        D, H, W = language_feature_weight_map.shape
+        language_feature_weight_map = language_feature_weight_map.view(D, -1)
+        codebooks = self._local_language_feature_codebooks[int(region_id)]
+        language_feature = codebooks.view(-1, 512).T @ language_feature_weight_map
+        language_feature = language_feature.view(512, H, W)
+        return language_feature
+
+    # Backward-compatible wrapper
+    def compute_final_feature_map(self, language_feature_weight_map):
+        return self.compute_global_final_feature_map(language_feature_weight_map)

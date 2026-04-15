@@ -85,6 +85,17 @@ class OptimizationParams(ParamGroup):
         self.quick_render = False
         self.vq_layer_num = 1
         self.codebook_size = 64
+        # -------- Local-Global Sparse Language Field (MVP, Python main path) --------
+        # NOTE: For MVP we keep codebook sizes equal to `codebook_size` to avoid CUDA changes.
+        self.global_codebook_size = 64
+        self.local_codebook_size = 64
+        self.global_topk = 1
+        self.local_topk = 1
+        self.num_local_regions = 8
+        self.local_region_mode = "grid"
+        self.global_local_alpha = 0.5
+        # init: 'copy_global' (stable) or 'random'
+        self.local_codebook_init_mode = "copy_global"
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01

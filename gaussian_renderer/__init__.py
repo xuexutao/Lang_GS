@@ -12,11 +12,38 @@ import time
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+try:
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+except ModuleNotFoundError:
+    # Allow running from repo root without `pip install -e submodules/...`.
+    import os
+    import sys
+    _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+    _raster_submodule = os.path.join(_repo_root, "submodules", "efficient-langsplat-rasterization")
+    if _raster_submodule not in sys.path:
+        sys.path.append(_raster_submodule)
+    try:
+        from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+    except Exception as e:
+        raise ImportError(
+            "Failed to import `diff_gaussian_rasterization` extension. "
+            "Build/install the rasterizer under `submodules/efficient-langsplat-rasterization` "
+            "(typically requires CUDA)."
+        ) from e
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, opt, scaling_modifier = 1.0, override_color = None):
+def render(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    opt,
+    scaling_modifier: float = 1.0,
+    override_color=None,
+    language_branch: str = "global",
+    gaussian_mask: torch.Tensor = None,
+):
     """
     Render the scene. 
     
@@ -57,6 +84,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     opacity = pc.get_opacity
 
+    if gaussian_mask is not None:
+        # Ensure boolean mask on the same device
+        gaussian_mask = gaussian_mask.to(device=means3D.device)
+        if gaussian_mask.dtype != torch.bool:
+            gaussian_mask = gaussian_mask.bool()
+
+        means3D = means3D[gaussian_mask]
+        means2D = means2D[gaussian_mask]
+        opacity = opacity[gaussian_mask]
+
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
     scales = None
@@ -64,9 +101,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier)
+        if gaussian_mask is not None:
+            cov3D_precomp = cov3D_precomp[gaussian_mask]
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
+        if gaussian_mask is not None:
+            scales = scales[gaussian_mask]
+            rotations = rotations[gaussian_mask]
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -74,13 +116,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            features = pc.get_features
+            if gaussian_mask is not None:
+                features = features[gaussian_mask]
+            shs_view = features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            xyz = pc.get_xyz
+            if gaussian_mask is not None:
+                xyz = xyz[gaussian_mask]
+            dir_pp = (xyz - viewpoint_camera.camera_center.repeat(shs_view.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
             shs = pc.get_features
+            if gaussian_mask is not None:
+                shs = shs[gaussian_mask]
     else:
         colors_precomp = override_color
     
@@ -93,7 +143,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         language_feature_weights = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
 
     elif opt.include_feature:
-        language_feature_weights = pc.get_render_weights(opt.topk)
+        # Allow global/local branch selection.
+        if language_branch == "local":
+            topk = int(getattr(opt, "local_topk", getattr(opt, "topk", 1)))
+        else:
+            topk = int(getattr(opt, "global_topk", getattr(opt, "topk", 1)))
+        language_feature_weights = pc.get_render_weights(topk, branch=language_branch)
+        if gaussian_mask is not None:
+            language_feature_weights = language_feature_weights[gaussian_mask]
         language_feature_weights_quick = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
         language_feature_indices = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
     

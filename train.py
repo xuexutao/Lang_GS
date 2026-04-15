@@ -57,7 +57,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         rvq.fit_quantizers(features)
         codebooks = torch.stack(rvq.quantizers, dim=0).to(device)
         with torch.no_grad():
-            gaussians._language_feature_codebooks.data.copy_(codebooks)
+            # Global branch init (legacy alias points to global too)
+            if getattr(gaussians, "_global_language_feature_codebooks", None) is not None:
+                gaussians._global_language_feature_codebooks.data.copy_(codebooks)
+                gaussians._language_feature_codebooks = gaussians._global_language_feature_codebooks
+            else:
+                gaussians._language_feature_codebooks.data.copy_(codebooks)
+
+            # Local branch init
+            if getattr(gaussians, "_local_language_feature_codebooks", None) is not None:
+                init_mode = str(getattr(opt, "local_codebook_init_mode", "copy_global"))
+                if init_mode == "random":
+                    pass
+                else:
+                    # default: copy global codebooks to every region for stable start
+                    R = gaussians._local_language_feature_codebooks.shape[0]
+                    gaussians._local_language_feature_codebooks.data.copy_(codebooks.unsqueeze(0).repeat(R, 1, 1, 1))
 
         
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -105,9 +120,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        opt.topk = args.topk
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt)
-        image, language_feature_weight_map, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["language_feature_weight_map"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        # Keep compatibility with legacy CLI flag `--topk`.
+        # If user only sets --topk, propagate it to both global/local topk.
+        if hasattr(args, "topk"):
+            if hasattr(args, "global_topk") and int(args.global_topk) == int(getattr(opt, "global_topk", 1)):
+                opt.global_topk = int(args.topk)
+            else:
+                opt.global_topk = int(getattr(args, "global_topk", getattr(opt, "global_topk", 1)))
+
+            if hasattr(args, "local_topk") and int(args.local_topk) == int(getattr(opt, "local_topk", 1)):
+                opt.local_topk = int(args.topk)
+            else:
+                opt.local_topk = int(getattr(args, "local_topk", getattr(opt, "local_topk", 1)))
+
+        # Render global branch
+        render_pkg_g = render(viewpoint_cam, gaussians, pipe, background, opt, language_branch="global")
+        image, global_weight_map, viewspace_point_tensor, visibility_filter, radii = (
+            render_pkg_g["render"],
+            render_pkg_g["language_feature_weight_map"],
+            render_pkg_g["viewspace_points"],
+            render_pkg_g["visibility_filter"],
+            render_pkg_g["radii"],
+        )
         
         # Loss
         if opt.include_feature:
@@ -116,7 +150,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # In this paper, we select layer_num = 1
             layer_num, _, _ = gaussians.get_language_feature_codebooks.shape
             layer_idx = min(int(iteration / 10000 * layer_num), layer_num - 1)
-            language_feature = gaussians.compute_layer_feature_map(language_feature_weight_map, layer_idx)
+
+            # Global feature reconstruction
+            global_feature = gaussians.compute_global_layer_feature_map(global_weight_map, layer_idx)
+
+            # Local feature reconstruction: render per region (MVP avoids changing CUDA channel count)
+            local_feature = torch.zeros_like(global_feature)
+            num_regions = int(getattr(opt, "num_local_regions", 1))
+            if num_regions > 1 and getattr(gaussians, "_local_region_ids", None) is not None:
+                for rid in range(num_regions):
+                    mask = gaussians.get_local_region_mask(rid)
+                    if mask.sum() == 0:
+                        continue
+                    render_pkg_l = render(
+                        viewpoint_cam,
+                        gaussians,
+                        pipe,
+                        background,
+                        opt,
+                        language_branch="local",
+                        gaussian_mask=mask,
+                    )
+                    local_weight_map = render_pkg_l["language_feature_weight_map"]
+                    local_feature = local_feature + gaussians.compute_local_layer_feature_map(local_weight_map, layer_idx, rid)
+
+            alpha = float(getattr(opt, "global_local_alpha", 0.5))
+            language_feature = alpha * global_feature + (1.0 - alpha) * local_feature
             if args.normalize:
                 language_feature = language_feature / (language_feature.norm(dim=0, keepdim=True) + 1e-10)
             loss = 0
