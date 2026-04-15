@@ -79,10 +79,9 @@
 
 ### 2.4 `train.py`
 
-- feature 训练阶段：
-  - global：一次 render
-  - local：按 region 多次 render（用 `gaussian_mask` 子集渲染），重建后累加
-  - fused：`alpha * global + (1 - alpha) * local`
+- feature 训练阶段（已升级为 CUDA 方案1的一次 render）：
+  - 只做一次 render 输出 packed weight map（global + R*local），不再 per-region 多次 render
+  - Python 侧对 packed weight map 做切片重建 global/local，再融合成 fused：`alpha * global + (1 - alpha) * local`
 - codebook 初始化：
   - global codebook：沿用原 `ResidualVectorQuantizationWithClustering` 初始化
   - local codebook：默认 `copy_global` 到每个 region（或 `random` 不处理）
@@ -90,10 +89,25 @@
 
 ### 2.5 `eval_lerf.py`
 
-- `render_language_feature_map(...)` 改为输出 fused feature map：
-  - global 一次 render
-  - local per-region 多次 render
-  - fused 后返回
+- `render_language_feature_map(...)` 改为 fused feature map（一次 render 的 packed weight map 切片重建）
+
+### 2.6 CUDA 方案1（关键提速改动）
+
+- `submodules/efficient-langsplat-rasterization/cuda_rasterizer/config.h`：
+  - 新增 `MAX_LOCAL_REGIONS`（默认 8）
+  - 区分 `NUM_CHANNELS_language_feature_BASE=64` 与 `NUM_CHANNELS_language_feature_PACKED=64*(1+MAX_LOCAL_REGIONS)`
+  - quick_render 仍使用 BASE（输出 3*64），include_feature 使用 PACKED
+- `submodules/efficient-langsplat-rasterization/cuda_rasterizer/forward.cu`：
+  - kernel 模板参数拆分 BASE vs PACKED
+  - quick_render 的 WT 长度保持 `3*BASE`
+  - include_feature 的 F 长度改为 `PACKED`
+- `submodules/efficient-langsplat-rasterization/rasterize_points.cu`：
+  - include_feature 输出改为 `[PACKED, H, W]`
+  - backward 的 `dL_dlanguage_feature` 改为 `[P, PACKED]`
+- `submodules/efficient-langsplat-rasterization/cuda_rasterizer/backward.cu`：
+  - backward kernel 的 F 维度改为 `PACKED`
+
+使用约束：运行时 `--num_local_regions <= MAX_LOCAL_REGIONS`，否则需要改 `MAX_LOCAL_REGIONS` 重新编译 rasterizer。
 
 ---
 
@@ -115,6 +129,12 @@
 
 - 训练（feature 训练，基于已有 checkpoint 的流程不变）：
   - 通过参数控制：`--num_local_regions`、`--global_local_alpha`、`--global_topk`、`--local_topk`
+- 训练提速（推荐，避免 per-region 全量渲染带来的倍数开销）：
+  - `--local_region_sample_num <K>`：每次迭代只随机渲染 K 个非空 region（其余 region 通过跨迭代覆盖），并做期望尺度修正
+    - `K<0` 表示全量（默认行为）
+    - `K=0` 表示关闭 local 分支（退化为 global-only）
+    - 推荐从 `K=1/2` 开始
+  - `--local_render_interval <N>`：每 N 次迭代才计算一次 local 分支，其余迭代只用 global 分支训练（`N=1` 表示每次都算）
+    - 推荐从 `N=2/4` 开始
 - LERF 评估：
   - 使用训练输出目录的 `cfg_args` 会自动携带 local-global 配置
-

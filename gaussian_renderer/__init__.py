@@ -143,12 +143,24 @@ def render(
         language_feature_weights = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)
 
     elif opt.include_feature:
-        # Allow global/local branch selection.
-        if language_branch == "local":
-            topk = int(getattr(opt, "local_topk", getattr(opt, "topk", 1)))
+        # CUDA scheme-1 requires packed per-gaussian features.
+        use_packed = bool(getattr(opt, "use_cuda_packed_local_global", False))
+        num_regions = int(getattr(opt, "num_local_regions", 1))
+        has_local = getattr(pc, "_local_region_ids", None) is not None and getattr(pc, "_local_language_feature_logits", None) is not None
+
+        if use_packed and num_regions > 1 and has_local:
+            gk = int(getattr(opt, "global_topk", getattr(opt, "topk", 1)))
+            lk = int(getattr(opt, "local_topk", getattr(opt, "topk", 1)))
+            # language_branch controls whether we pack global-only / local-only / fused
+            mode = "fused" if language_branch == "packed" else str(language_branch)
+            if mode not in {"fused", "global", "local"}:
+                mode = "fused"
+            language_feature_weights = pc.get_packed_render_weights(gk, lk, num_regions, mode=mode)
         else:
+            # Fallback: global-only weights (will still work with legacy rasterizer)
             topk = int(getattr(opt, "global_topk", getattr(opt, "topk", 1)))
-        language_feature_weights = pc.get_render_weights(topk, branch=language_branch)
+            language_feature_weights = pc.get_render_weights(topk, branch="global")
+
         if gaussian_mask is not None:
             language_feature_weights = language_feature_weights[gaussian_mask]
         language_feature_weights_quick = torch.zeros((1,), dtype=opacity.dtype, device=opacity.device)

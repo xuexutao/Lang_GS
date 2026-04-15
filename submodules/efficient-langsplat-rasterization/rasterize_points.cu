@@ -75,11 +75,11 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor out_language_feature;
   if (quick_render) {
-	const int LENGTH = 3 * NUM_CHANNELS_language_feature;
+	const int LENGTH = 3 * NUM_CHANNELS_language_feature_BASE;
 	out_language_feature = torch::full({LENGTH, H, W}, 0.0, float_opts);
   }
   else if (include_feature) {
-	out_language_feature = torch::full({NUM_CHANNELS_language_feature, H, W}, 0.0, float_opts);
+	out_language_feature = torch::full({NUM_CHANNELS_language_feature_PACKED, H, W}, 0.0, float_opts);
   }
   else {
 	out_language_feature = torch::full({1}, 0.0, float_opts);
@@ -181,7 +181,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
   torch::Tensor dL_dlanguage_feature;
   if (include_feature) {
-	dL_dlanguage_feature = torch::zeros({P, NUM_CHANNELS_language_feature}, means3D.options());
+	dL_dlanguage_feature = torch::zeros({P, NUM_CHANNELS_language_feature_PACKED}, means3D.options());
 	// dL_dlanguage_feature = torch::zeros({1}, means3D.options());
   } else {
 	dL_dlanguage_feature = torch::zeros({1}, means3D.options());

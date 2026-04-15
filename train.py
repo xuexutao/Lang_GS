@@ -13,6 +13,7 @@ import os
 import torch
 import torch.nn as nn
 from random import randint
+import random
 from utils.loss_utils import l1_loss, ssim, cos_loss
 from gaussian_renderer import render, network_gui
 import sys
@@ -74,6 +75,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     R = gaussians._local_language_feature_codebooks.shape[0]
                     gaussians._local_language_feature_codebooks.data.copy_(codebooks.unsqueeze(0).repeat(R, 1, 1, 1))
 
+    # Precompute local region masks once (feature training freezes xyz/opacity/etc.)
+    # Used only for sampling which regions to reconstruct (no longer used for per-region render).
+    region_masks = None
+    non_empty_region_ids = None
+    if opt.include_feature:
+        num_regions = int(getattr(opt, "num_local_regions", 1))
+        if num_regions > 1 and getattr(gaussians, "_local_region_ids", None) is not None:
+            region_masks = [gaussians.get_local_region_mask(rid) for rid in range(num_regions)]
+            non_empty_region_ids = [rid for rid, m in enumerate(region_masks) if bool(m.any().item())]
+
         
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -133,14 +144,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 opt.local_topk = int(getattr(args, "local_topk", getattr(opt, "local_topk", 1)))
 
-        # Render global branch
-        render_pkg_g = render(viewpoint_cam, gaussians, pipe, background, opt, language_branch="global")
-        image, global_weight_map, viewspace_point_tensor, visibility_filter, radii = (
-            render_pkg_g["render"],
-            render_pkg_g["language_feature_weight_map"],
-            render_pkg_g["viewspace_points"],
-            render_pkg_g["visibility_filter"],
-            render_pkg_g["radii"],
+        # Render once (CUDA packed local-global scheme-1 when enabled)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt, language_branch="packed")
+        image, weight_map, viewspace_point_tensor, visibility_filter, radii = (
+            render_pkg["render"],
+            render_pkg["language_feature_weight_map"],
+            render_pkg["viewspace_points"],
+            render_pkg["visibility_filter"],
+            render_pkg["radii"],
         )
         
         # Loss
@@ -151,31 +162,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             layer_num, _, _ = gaussians.get_language_feature_codebooks.shape
             layer_idx = min(int(iteration / 10000 * layer_num), layer_num - 1)
 
-            # Global feature reconstruction
-            global_feature = gaussians.compute_global_layer_feature_map(global_weight_map, layer_idx)
+            # Global feature reconstruction (auto-slices packed map)
+            global_feature = gaussians.compute_global_layer_feature_map(weight_map, layer_idx)
 
-            # Local feature reconstruction: render per region (MVP avoids changing CUDA channel count)
-            local_feature = torch.zeros_like(global_feature)
-            num_regions = int(getattr(opt, "num_local_regions", 1))
-            if num_regions > 1 and getattr(gaussians, "_local_region_ids", None) is not None:
-                for rid in range(num_regions):
-                    mask = gaussians.get_local_region_mask(rid)
-                    if mask.sum() == 0:
-                        continue
-                    render_pkg_l = render(
-                        viewpoint_cam,
-                        gaussians,
-                        pipe,
-                        background,
-                        opt,
-                        language_branch="local",
-                        gaussian_mask=mask,
-                    )
-                    local_weight_map = render_pkg_l["language_feature_weight_map"]
-                    local_feature = local_feature + gaussians.compute_local_layer_feature_map(local_weight_map, layer_idx, rid)
-
+            # Local feature reconstruction (from packed map, no extra renders)
             alpha = float(getattr(opt, "global_local_alpha", 0.5))
-            language_feature = alpha * global_feature + (1.0 - alpha) * local_feature
+            alpha_eff = alpha
+            local_feature = torch.zeros_like(global_feature)
+
+            num_regions = int(getattr(opt, "num_local_regions", 1))
+            local_interval = int(getattr(opt, "local_render_interval", 1))
+            sample_num = int(getattr(opt, "local_region_sample_num", -1))
+            do_local = (local_interval <= 1) or (iteration % local_interval == 0)
+
+            if (not do_local) or (num_regions <= 1) or (getattr(gaussians, "_local_language_feature_codebooks", None) is None):
+                alpha_eff = 1.0
+            else:
+                # base_C inferred from global codebooks
+                layer_num, codebook_size, _ = gaussians.get_language_feature_codebooks.shape
+                base_C = int(layer_num * codebook_size)
+                # weight_map layout: [base_C + num_regions*base_C, H, W]
+                # choose subset of regions for compute to reduce Python overhead (optional)
+                if region_masks is None or non_empty_region_ids is None or len(non_empty_region_ids) == 0:
+                    chosen_rids = list(range(num_regions))
+                else:
+                    if sample_num == 0:
+                        alpha_eff = 1.0
+                        chosen_rids = []
+                    elif sample_num < 0 or sample_num >= len(non_empty_region_ids):
+                        chosen_rids = non_empty_region_ids
+                    else:
+                        chosen_rids = random.sample(non_empty_region_ids, sample_num)
+
+                for rid in chosen_rids:
+                    start = base_C + int(rid) * base_C
+                    end = start + base_C
+                    local_slice = weight_map[start:end]
+                    local_feature = local_feature + gaussians.compute_local_layer_feature_map(local_slice, layer_idx, rid)
+
+                if len(chosen_rids) > 0 and non_empty_region_ids is not None and len(chosen_rids) < len(non_empty_region_ids):
+                    local_feature = local_feature * (float(len(non_empty_region_ids)) / float(len(chosen_rids)))
+
+            language_feature = alpha_eff * global_feature + (1.0 - alpha_eff) * local_feature
             if args.normalize:
                 language_feature = language_feature / (language_feature.norm(dim=0, keepdim=True) + 1e-10)
             loss = 0

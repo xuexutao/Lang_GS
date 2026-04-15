@@ -690,6 +690,65 @@ class GaussianModel:
             soft_code = softmax_to_topk_soft_code(logits[:, i*codebook_size:(i+1)*codebook_size], k)
             weights.append(soft_code)
         return torch.cat(weights, dim=-1).float()
+
+    def get_packed_render_weights(
+        self,
+        global_topk: int,
+        local_topk: int,
+        num_local_regions: int,
+        mode: str = "fused",
+    ):
+        """Return per-gaussian packed weights of shape [N, base_C*(1+R)].
+
+        Layout:
+        - packed[:, 0:base_C] = global weights (or 0 if mode='local')
+        - packed[:, base_C + rid*base_C : base_C + (rid+1)*base_C] = local weights (or 0 if mode='global')
+
+        Notes:
+        - base_C = vq_layer_num * codebook_size
+        - This matches CUDA scheme-1 packed channel output.
+        """
+        if num_local_regions <= 1:
+            # Degenerates to global-only
+            return self.get_render_weights(global_topk, branch="global")
+
+        if self._local_region_ids is None:
+            raise ValueError("local region ids is None")
+        if self._local_language_feature_logits is None or self._local_language_feature_codebooks is None:
+            raise ValueError("local language feature params is None")
+
+        # base_C inferred from global codebooks (kept consistent with rasterizer channels)
+        layer_num, codebook_size, _ = self.get_language_feature_codebooks.shape
+        base_C = int(layer_num * codebook_size)
+        packed_C = int(base_C * (1 + int(num_local_regions)))
+        N = int(self.get_xyz.shape[0])
+
+        device = self.get_xyz.device
+        packed = torch.zeros((N, packed_C), device=device, dtype=torch.float32)
+
+        mode = str(mode)
+        if mode not in {"fused", "global", "local"}:
+            raise ValueError(f"Unknown packed weight mode: {mode}")
+
+        if mode in {"fused", "global"}:
+            g = self.get_render_weights(int(global_topk), branch="global")
+            if g.shape[1] != base_C:
+                raise ValueError(f"global weights dim mismatch: got {g.shape[1]}, expect {base_C}")
+            packed[:, :base_C] = g
+
+        if mode in {"fused", "local"}:
+            l = self.get_render_weights(int(local_topk), branch="local")
+            if l.shape[1] != base_C:
+                raise ValueError(f"local weights dim mismatch: got {l.shape[1]}, expect {base_C}")
+
+            rid = self._local_region_ids.long().clamp(0, int(num_local_regions) - 1)
+            # scatter local weights into region-specific segment
+            base_idx = (base_C + rid * base_C).view(-1, 1)  # [N,1]
+            ar = torch.arange(base_C, device=device, dtype=torch.long).view(1, -1)  # [1,base_C]
+            idx = base_idx + ar  # [N,base_C]
+            packed.scatter_(1, idx, l)
+
+        return packed
     
     def compute_feature_maps(self, language_feature_weight_map):
         D, H, W = language_feature_weight_map.shape
@@ -708,6 +767,10 @@ class GaussianModel:
         D, H, W = language_feature_weight_map.shape
         language_feature_weight_map = language_feature_weight_map.view(D, -1)
         layer_num, codebook_size, _ = self.get_language_feature_codebooks.shape
+        base_C = layer_num * codebook_size
+        if D > base_C:
+            # packed layout -> take the global segment
+            language_feature_weight_map = language_feature_weight_map[:base_C]
         for i in range(layer_idx + 1):
             language_feature = self.get_language_feature_codebooks[i].T @ language_feature_weight_map[i * codebook_size:(i+1)*codebook_size]
             language_feature = language_feature.view(512, H, W)
@@ -739,6 +802,10 @@ class GaussianModel:
     def compute_global_final_feature_map(self, language_feature_weight_map):
         D, H, W = language_feature_weight_map.shape
         language_feature_weight_map = language_feature_weight_map.view(D, -1)
+        layer_num, codebook_size, _ = self.get_language_feature_codebooks.shape
+        base_C = layer_num * codebook_size
+        if D > base_C:
+            language_feature_weight_map = language_feature_weight_map[:base_C]
         language_feature = self.get_language_feature_codebooks.view(-1, 512).T @ language_feature_weight_map
         language_feature = language_feature.view(512, H, W)
         return language_feature

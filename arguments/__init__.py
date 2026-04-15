@@ -96,6 +96,14 @@ class OptimizationParams(ParamGroup):
         self.global_local_alpha = 0.5
         # init: 'copy_global' (stable) or 'random'
         self.local_codebook_init_mode = "copy_global"
+        # CUDA scheme-1: pack (global + R*local) weights into channels once
+        # Requires rasterizer compiled with MAX_LOCAL_REGIONS >= num_local_regions
+        self.use_cuda_packed_local_global = True
+        # Performance knobs (do not require CUDA changes)
+        # - local_region_sample_num: <0 means use all non-empty regions; 0 means disable local branch in loss
+        # - local_render_interval: >1 means only compute local branch every N iterations
+        self.local_region_sample_num = -1
+        self.local_render_interval = 1
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
         self.percent_dense = 0.01

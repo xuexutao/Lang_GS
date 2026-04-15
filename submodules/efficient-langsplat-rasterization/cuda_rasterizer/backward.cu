@@ -680,7 +680,7 @@ void BACKWARD::render(
 	float* dL_dlanguage_feature,
 	bool include_feature)
 {
-	renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature> << <grid, block >> >(
+	renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature_PACKED> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,

@@ -201,22 +201,24 @@ def localization_process_cuda(sem_map:torch.tensor, clip_model, img_ann):
 
 def render_language_feature_map(gaussians:GaussianModel, view, pipeline, background, args):
     with torch.no_grad():
-        # Global branch
-        output_g = render(view, gaussians, pipeline, background, args, language_branch="global")
-        global_weight_map = output_g['language_feature_weight_map']
-        global_feat = gaussians.compute_global_final_feature_map(global_weight_map)
+        # One-pass render (CUDA packed local-global scheme-1 when enabled)
+        output = render(view, gaussians, pipeline, background, args, language_branch="packed")
+        weight_map = output['language_feature_weight_map']
 
-        # Local branch (MVP: render per region)
+        # Global reconstruction (auto-slices packed map)
+        global_feat = gaussians.compute_global_final_feature_map(weight_map)
+
+        # Local reconstruction from packed map
         local_feat = torch.zeros_like(global_feat)
         num_regions = int(getattr(args, "num_local_regions", 1))
-        if num_regions > 1 and getattr(gaussians, "_local_region_ids", None) is not None:
+        if num_regions > 1 and getattr(gaussians, "_local_language_feature_codebooks", None) is not None:
+            layer_num, codebook_size, _ = gaussians.get_language_feature_codebooks.shape
+            base_C = int(layer_num * codebook_size)
             for rid in range(num_regions):
-                mask = gaussians.get_local_region_mask(rid)
-                if mask.sum() == 0:
-                    continue
-                output_l = render(view, gaussians, pipeline, background, args, language_branch="local", gaussian_mask=mask)
-                local_weight_map = output_l['language_feature_weight_map']
-                local_feat = local_feat + gaussians.compute_local_final_feature_map(local_weight_map, rid)
+                start = base_C + rid * base_C
+                end = start + base_C
+                local_slice = weight_map[start:end]
+                local_feat = local_feat + gaussians.compute_local_final_feature_map(local_slice, rid)
 
         alpha = float(getattr(args, "global_local_alpha", 0.5))
         language_feature_map = alpha * global_feat + (1.0 - alpha) * local_feat

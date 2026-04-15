@@ -259,7 +259,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS, uint32_t CHANNELS_language_feature, uint32_t CHANNELS_quick_render>
+template <uint32_t CHANNELS, uint32_t CHANNELS_language_feature_packed, uint32_t CHANNELS_quick_render, uint32_t CHANNELS_language_feature_base>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -309,9 +309,9 @@ renderCUDA(
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 	
-	const int LENGTH = 3 * CHANNELS_language_feature;
+	const int LENGTH = 3 * CHANNELS_language_feature_base;
 	float WT[LENGTH] = { 0 };
-	float F[CHANNELS_language_feature] = { 0 };
+	float F[CHANNELS_language_feature_packed] = { 0 };
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -377,8 +377,8 @@ renderCUDA(
 
 			else if (include_feature)
 			{
-				for (int ch = 0; ch < CHANNELS_language_feature; ch++)
-					F[ch] += language_feature[collected_id[j] * CHANNELS_language_feature + ch] * alpha * T;
+				for (int ch = 0; ch < CHANNELS_language_feature_packed; ch++)
+					F[ch] += language_feature[collected_id[j] * CHANNELS_language_feature_packed + ch] * alpha * T;
 			}
 
 			T = test_T;
@@ -400,12 +400,12 @@ renderCUDA(
 		
 		if (quick_render)
 		{
-			for (int ch = 0; ch < 3 * CHANNELS_language_feature; ch++)
+			for (int ch = 0; ch < 3 * CHANNELS_language_feature_base; ch++)
 				out_language_feature[ch * H * W + pix_id] = WT[ch];
 		}
 		else if (include_feature) 
 		{
-			for (int ch = 0; ch < CHANNELS_language_feature; ch++)
+			for (int ch = 0; ch < CHANNELS_language_feature_packed; ch++)
 				out_language_feature[ch * H * W + pix_id] = F[ch]; //bg_color ???
 		}
 		
@@ -432,7 +432,7 @@ void FORWARD::render(
 	bool include_feature,
 	bool quick_render)
 {
-	renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature, NUM_CHANNELS_quick_render> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature_PACKED, NUM_CHANNELS_quick_render, NUM_CHANNELS_language_feature_BASE> << <grid, block >> > (
 		ranges,
 		point_list,
 		W, H,
