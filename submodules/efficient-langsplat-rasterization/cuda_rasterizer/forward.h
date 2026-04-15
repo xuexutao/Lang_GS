@@ -65,7 +65,8 @@ namespace FORWARD
 		float* out_color,
 		float* out_language_feature,
 		bool include_feature,
-		bool quick_render);
+		bool quick_render,
+		bool packed_feature);
 }
 
 

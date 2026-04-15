@@ -430,25 +430,50 @@ void FORWARD::render(
 	float* out_color,
 	float* out_language_feature,
 	bool include_feature,
-	bool quick_render)
+	bool quick_render,
+	bool packed_feature)
 {
-	renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature_PACKED, NUM_CHANNELS_quick_render, NUM_CHANNELS_language_feature_BASE> << <grid, block >> > (
-		ranges,
-		point_list,
-		W, H,
-		means2D,
-		colors,
-		language_feature,
-		language_feature_weights,
-		language_feature_indices,
-		conic_opacity,
-		final_T,
-		n_contrib,
-		bg_color,
-		out_color,
-		out_language_feature,
-		include_feature,
-		quick_render);
+	if (packed_feature)
+	{
+		renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature_PACKED, NUM_CHANNELS_quick_render, NUM_CHANNELS_language_feature_BASE> << <grid, block >> > (
+			ranges,
+			point_list,
+			W, H,
+			means2D,
+			colors,
+			language_feature,
+			language_feature_weights,
+			language_feature_indices,
+			conic_opacity,
+			final_T,
+			n_contrib,
+			bg_color,
+			out_color,
+			out_language_feature,
+			include_feature,
+			quick_render);
+	}
+	else
+	{
+		// Base-channel include_feature: output length == NUM_CHANNELS_language_feature_BASE.
+		renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature_BASE, NUM_CHANNELS_quick_render, NUM_CHANNELS_language_feature_BASE> << <grid, block >> > (
+			ranges,
+			point_list,
+			W, H,
+			means2D,
+			colors,
+			language_feature,
+			language_feature_weights,
+			language_feature_indices,
+			conic_opacity,
+			final_T,
+			n_contrib,
+			bg_color,
+			out_color,
+			out_language_feature,
+			include_feature,
+			quick_render);
+	}
 
 }
 

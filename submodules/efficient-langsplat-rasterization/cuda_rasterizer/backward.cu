@@ -678,26 +678,52 @@ void BACKWARD::render(
 	float* dL_dopacity,
 	float* dL_dcolors,
 	float* dL_dlanguage_feature,
-	bool include_feature)
+	bool include_feature,
+	bool packed_feature)
 {
-	renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature_PACKED> << <grid, block >> >(
-		ranges,
-		point_list,
-		W, H,
-		bg_color,
-		means2D,
-		conic_opacity,
-		colors,
-		language_feature,
-		final_Ts,
-		n_contrib,
-		dL_dpixels,
-		dL_dpixels_F,
-		dL_dmean2D,
-		dL_dconic2D,
-		dL_dopacity,
-		dL_dcolors,
-		dL_dlanguage_feature,
-		include_feature);
+	if (packed_feature)
+	{
+		renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature_PACKED> << <grid, block >> >(
+			ranges,
+			point_list,
+			W, H,
+			bg_color,
+			means2D,
+			conic_opacity,
+			colors,
+			language_feature,
+			final_Ts,
+			n_contrib,
+			dL_dpixels,
+			dL_dpixels_F,
+			dL_dmean2D,
+			dL_dconic2D,
+			dL_dopacity,
+			dL_dcolors,
+			dL_dlanguage_feature,
+			include_feature);
+	}
+	else
+	{
+		renderCUDA<NUM_CHANNELS, NUM_CHANNELS_language_feature_BASE> << <grid, block >> >(
+			ranges,
+			point_list,
+			W, H,
+			bg_color,
+			means2D,
+			conic_opacity,
+			colors,
+			language_feature,
+			final_Ts,
+			n_contrib,
+			dL_dpixels,
+			dL_dpixels_F,
+			dL_dmean2D,
+			dL_dconic2D,
+			dL_dopacity,
+			dL_dcolors,
+			dL_dlanguage_feature,
+			include_feature);
+	}
  
 }

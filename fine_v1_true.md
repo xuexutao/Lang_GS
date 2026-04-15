@@ -119,6 +119,21 @@
 - `--local_region_sample_num K`：每次只计算 K 个非空 region（并做期望尺度修正），推荐从 `K=2` 起。
 - `--local_render_interval N`：每 N 次迭代才计算一次 local，其余迭代退化为 global-only（`alpha_eff=1.0`），推荐从 `N=2/4` 起。
 
+#### 重要修复：BASE(64) / PACKED(64*(1+R)) 动态选择
+
+为了配合 `--local_region_sample_num K` 的“小 K 训练加速”，训练端会在 `K` 较小时采用：
+
+- 1 次 global render（BASE=64 通道）
+- K 次 local render（每次只渲染一个 region 的 gaussians，BASE=64 通道）
+
+这能避免每次都做 PACKED=576 通道的反向。
+
+但这要求 rasterizer 能根据 `language_feature_precomp` 的通道数动态选择 BASE/PACKED kernel。该能力已在 `submodules/efficient-langsplat-rasterization` 中补齐。
+
+如果你的训练环境仍是旧编译产物（include_feature 强制走 PACKED），则当训练端尝试 BASE=64 时会出现 `CUDA error: an illegal memory access was encountered`。
+
+解决办法：更新代码后**必须在训练机重编译扩展**（见 4.1）。
+
 ### 2.6 CUDA 方案1（关键提速改动）
 
 - `submodules/efficient-langsplat-rasterization/cuda_rasterizer/config.h`：
@@ -171,7 +186,7 @@
 
 关键约束：`--num_local_regions <= MAX_LOCAL_REGIONS`，默认 `MAX_LOCAL_REGIONS=8`。
 
-示例（单层 feature_level=1，带耗时分解与降耗时参数）：
+示例（单层 feature_level=1，带耗时分解与降耗时参数；`K=2` 会触发 BASE=64 的多次 render 加速）：
 
 - `python train.py -s <DATASET_ROOT>/<SCENE> -m output/<SCENE>_<IDX> --start_checkpoint <RGB_CKPT> --feature_level 1 --vq_layer_num 1 --codebook_size 64 --cos_loss --global_topk 4 --local_topk 4 --num_local_regions 8 --global_local_alpha 0.5 --local_region_mode grid --local_codebook_init_mode copy_global --time_breakdown --time_breakdown_first 5 --time_breakdown_every 50 --local_region_sample_num 2 --local_render_interval 1`
 

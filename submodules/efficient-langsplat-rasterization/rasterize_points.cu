@@ -65,25 +65,35 @@ RasterizeGaussiansCUDA(
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
   
-  const int P = means3D.size(0);
-  const int H = image_height;
-  const int W = image_width;
+	const int P = means3D.size(0);
+	const int H = image_height;
+	const int W = image_width;
 
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor out_language_feature;
-  if (quick_render) {
-	const int LENGTH = 3 * NUM_CHANNELS_language_feature_BASE;
-	out_language_feature = torch::full({LENGTH, H, W}, 0.0, float_opts);
-  }
-  else if (include_feature) {
-	out_language_feature = torch::full({NUM_CHANNELS_language_feature_PACKED, H, W}, 0.0, float_opts);
-  }
-  else {
-	out_language_feature = torch::full({1}, 0.0, float_opts);
-  }
+	torch::Tensor out_language_feature;
+	bool packed_feature = false;
+	int featC = 1;
+	if (quick_render) {
+		const int LENGTH = 3 * NUM_CHANNELS_language_feature_BASE;
+		out_language_feature = torch::full({LENGTH, H, W}, 0.0, float_opts);
+	}
+	else if (include_feature) {
+		if (language_feature.ndimension() != 2) {
+			AT_ERROR("language_feature_precomp must have dimensions (num_points, C)");
+		}
+		featC = (int)language_feature.size(1);
+		if (featC != NUM_CHANNELS_language_feature_BASE && featC != NUM_CHANNELS_language_feature_PACKED) {
+			AT_ERROR("Unsupported language_feature_precomp channel count. Expect BASE or PACKED.");
+		}
+		packed_feature = (featC == NUM_CHANNELS_language_feature_PACKED);
+		out_language_feature = torch::full({featC, H, W}, 0.0, float_opts);
+	}
+	else {
+		out_language_feature = torch::full({1}, 0.0, float_opts);
+	}
   // printf("in rasterize_points.cu\n");
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
@@ -104,11 +114,12 @@ RasterizeGaussiansCUDA(
 	  {
 		M = sh.size(1);
       }
-	  rendered = CudaRasterizer::Rasterizer::forward(
-	    geomFunc,
+		rendered = CudaRasterizer::Rasterizer::forward(
+		geomFunc,
 		binningFunc,
 		imgFunc,
-	    P, degree, M,
+		P, degree, M,
+		packed_feature,
 		background.contiguous().data<float>(),
 		W, H,
 		means3D.contiguous().data<float>(),
@@ -134,7 +145,7 @@ RasterizeGaussiansCUDA(
 		debug,
 		include_feature,
 		quick_render);
-  }
+	}
   return std::make_tuple(rendered, out_color, out_language_feature, radii, geomBuffer, binningBuffer, imgBuffer);
 }
 
@@ -165,9 +176,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const bool debug,
 	const bool include_feature) 
 {
-  const int P = means3D.size(0);
-  const int H = dL_dout_color.size(1);
-  const int W = dL_dout_color.size(2);
+	const int P = means3D.size(0);
+	const int H = dL_dout_color.size(1);
+	const int W = dL_dout_color.size(2);
   
   int M = 0;
   if(sh.size(0) != 0)
@@ -179,13 +190,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
 
-  torch::Tensor dL_dlanguage_feature;
-  if (include_feature) {
-	dL_dlanguage_feature = torch::zeros({P, NUM_CHANNELS_language_feature_PACKED}, means3D.options());
-	// dL_dlanguage_feature = torch::zeros({1}, means3D.options());
-  } else {
-	dL_dlanguage_feature = torch::zeros({1}, means3D.options());
-  }
+	torch::Tensor dL_dlanguage_feature;
+	bool packed_feature_bwd = false;
+	int featC_bwd = 1;
+	if (include_feature) {
+		if (dL_dout_language_feature.ndimension() != 3) {
+			AT_ERROR("dL_dout_language_feature must have dimensions (C, H, W)");
+		}
+		featC_bwd = (int)dL_dout_language_feature.size(0);
+		if (featC_bwd != NUM_CHANNELS_language_feature_BASE && featC_bwd != NUM_CHANNELS_language_feature_PACKED) {
+			AT_ERROR("Unsupported dL_dout_language_feature channel count. Expect BASE or PACKED.");
+		}
+		packed_feature_bwd = (featC_bwd == NUM_CHANNELS_language_feature_PACKED);
+		dL_dlanguage_feature = torch::zeros({P, featC_bwd}, means3D.options());
+	} else {
+		dL_dlanguage_feature = torch::zeros({1}, means3D.options());
+	}
   
   torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
@@ -196,9 +216,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   
   if(P != 0)
   {  
-	  CudaRasterizer::Rasterizer::backward(P, degree, M, R,
-	  background.contiguous().data<float>(),
-	  W, H, 
+		CudaRasterizer::Rasterizer::backward(P, degree, M, R,
+		packed_feature_bwd,
+		background.contiguous().data<float>(),
+		W, H, 
 	  means3D.contiguous().data<float>(),
 	  sh.contiguous().data<float>(),
 	  colors.contiguous().data<float>(),
@@ -227,10 +248,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dcov3D.contiguous().data<float>(),
 	  dL_dsh.contiguous().data<float>(),
 	  dL_dscales.contiguous().data<float>(),
-	  dL_drotations.contiguous().data<float>(),
-	  debug,
-	  include_feature);
-  }
+		dL_drotations.contiguous().data<float>(),
+		debug,
+		include_feature);
+	}
 
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dlanguage_feature, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations);
 }

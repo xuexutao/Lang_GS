@@ -200,6 +200,7 @@ int CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
 	const int P, int D, int M,
+	const bool packed_feature,
 	const float* background,
 	const int width, int height,
 	const float* means3D,
@@ -352,7 +353,8 @@ int CudaRasterizer::Rasterizer::forward(
 		out_color,
 		out_language_feature,
 		include_feature,
-		quick_render), debug) // 增加了参数
+		quick_render,
+		packed_feature), debug) // 增加了参数
 
 
 	// cudaEventRecord(stop, stream);
@@ -366,6 +368,7 @@ int CudaRasterizer::Rasterizer::forward(
 // to forward render pass
 void CudaRasterizer::Rasterizer::backward(
 	const int P, int D, int M, int R,
+	const bool packed_feature,
 	const float* background,
 	const int width, int height,
 	const float* means3D,
@@ -440,7 +443,8 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dopacity,
 		dL_dcolor,
 		dL_dlanguage_feature,
-		include_feature), debug)
+		include_feature,
+		packed_feature), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
