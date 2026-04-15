@@ -168,8 +168,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 opt.local_topk = int(getattr(args, "local_topk", getattr(opt, "local_topk", 1)))
 
-        # Render once (CUDA packed local-global scheme-1 when enabled)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt, language_branch="packed")
+        # Decide local training strategy before rendering.
+        num_regions = int(getattr(opt, "num_local_regions", 1))
+        local_interval = int(getattr(opt, "local_render_interval", 1))
+        sample_num = int(getattr(opt, "local_region_sample_num", -1))
+        do_local = (local_interval <= 1) or (iteration % local_interval == 0)
+        has_local_params = (getattr(gaussians, "_local_language_feature_codebooks", None) is not None) and (getattr(gaussians, "_local_language_feature_logits", None) is not None)
+        has_regions = (region_masks is not None) and (non_empty_region_ids is not None) and (len(non_empty_region_ids) > 0)
+        enable_local = opt.include_feature and do_local and num_regions > 1 and has_local_params and has_regions and (sample_num != 0)
+
+        # Render policy:
+        # - If local is disabled this iter -> render global (64ch) only.
+        # - If local is enabled and sample_num is small -> render global once + K local renders (avoid packed 576ch backward).
+        # - Otherwise -> render packed once (fastest when needing all regions).
+        use_sampled_multi_render = False
+        chosen_rids = []
+        if enable_local:
+            if sample_num > 0 and sample_num < len(non_empty_region_ids):
+                use_sampled_multi_render = True
+                chosen_rids = random.sample(non_empty_region_ids, sample_num)
+            elif sample_num > 0 and sample_num >= len(non_empty_region_ids):
+                chosen_rids = non_empty_region_ids
+            elif sample_num < 0:
+                chosen_rids = non_empty_region_ids
+
+        if (not enable_local) or use_sampled_multi_render:
+            # Main render: global-only (base channels).
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt, language_branch="global")
+        else:
+            # Full local: packed once.
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt, language_branch="packed")
+
         image, weight_map, viewspace_point_tensor, visibility_filter, radii = (
             render_pkg["render"],
             render_pkg["language_feature_weight_map"],
@@ -202,70 +231,55 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 torch.cuda.synchronize()
                 t_global = time.perf_counter()
 
-            # Local feature reconstruction (from packed map, no extra renders)
+            # Local feature reconstruction
             alpha = float(getattr(opt, "global_local_alpha", 0.5))
             alpha_eff = alpha
             local_feature = torch.zeros_like(global_feature)
 
-            num_regions = int(getattr(opt, "num_local_regions", 1))
-            local_interval = int(getattr(opt, "local_render_interval", 1))
-            sample_num = int(getattr(opt, "local_region_sample_num", -1))
-            do_local = (local_interval <= 1) or (iteration % local_interval == 0)
-
-            if (not do_local) or (num_regions <= 1) or (getattr(gaussians, "_local_language_feature_codebooks", None) is None):
+            if not enable_local:
                 alpha_eff = 1.0
                 if profile_this_iter:
                     t_local = t_global
             else:
-                # base_C inferred from global codebooks
-                layer_num, codebook_size, _ = gaussians.get_language_feature_codebooks.shape
-                base_C = int(layer_num * codebook_size)
-                expected_C = base_C * (1 + int(num_regions))
-                chosen_rids = []
-                if int(weight_map.shape[0]) < expected_C:
-                    # Render did not output packed channels (e.g. rasterizer not compiled with PACKED).
-                    alpha_eff = 1.0
-                    if not hasattr(training, "_warned_packed_mismatch"):
-                        print(
-                            f"[warn] language_feature_weight_map 通道数={int(weight_map.shape[0])}，"
-                            f"不足以支持 packed local-global（期望 >= {expected_C}）。已退化为 global-only。"
+                if use_sampled_multi_render:
+                    # Sampled local: K local renders with base channels (64) to avoid packed backward overhead.
+                    for rid in chosen_rids:
+                        local_pkg = render(
+                            viewpoint_cam,
+                            gaussians,
+                            pipe,
+                            background,
+                            opt,
+                            language_branch="local",
+                            gaussian_mask=region_masks[int(rid)],
                         )
-                        training._warned_packed_mismatch = True
+                        local_w = local_pkg["language_feature_weight_map"]
+                        local_feature = local_feature + gaussians.compute_local_layer_feature_map(local_w, layer_idx, int(rid))
+
+                    if len(chosen_rids) > 0 and len(chosen_rids) < len(non_empty_region_ids):
+                        local_feature = local_feature * (float(len(non_empty_region_ids)) / float(len(chosen_rids)))
                 else:
-                    # weight_map layout: [base_C + num_regions*base_C, H, W]
-                    # choose subset of regions for compute to reduce overhead (optional)
-                    if region_masks is None or non_empty_region_ids is None or len(non_empty_region_ids) == 0:
-                        chosen_rids = list(range(num_regions))
-                    else:
-                        if sample_num == 0:
-                            alpha_eff = 1.0
-                            chosen_rids = []
-                        elif sample_num < 0 or sample_num >= len(non_empty_region_ids):
-                            chosen_rids = non_empty_region_ids
-                        else:
-                            chosen_rids = random.sample(non_empty_region_ids, sample_num)
-
-                    # Fast path for the common setup: vq_layer_num == 1 (layer_num==1, layer_idx==0)
-                    if layer_num == 1 and layer_idx == 0 and len(chosen_rids) > 0:
-                        # [R, base_C, H, W] then pick chosen rids
-                        local_block = weight_map[base_C: base_C + int(num_regions) * base_C].view(int(num_regions), base_C, *weight_map.shape[1:])
-                        chosen_idx = torch.tensor(chosen_rids, device=weight_map.device, dtype=torch.long)
-                        local_sel = local_block[chosen_idx]
-                        w = local_sel.view(len(chosen_rids), base_C, -1)  # [M, K, HW]
-
-                        # codebooks: [M, K, 512]
-                        cb = gaussians._local_language_feature_codebooks[chosen_idx, 0]
-                        local_feat_batched = torch.bmm(cb.transpose(1, 2), w)  # [M, 512, HW]
-                        local_feature = local_feat_batched.sum(dim=0).view(512, *weight_map.shape[1:])
+                    # Packed local: decode from packed weight map.
+                    layer_num, codebook_size, _ = gaussians.get_language_feature_codebooks.shape
+                    base_C = int(layer_num * codebook_size)
+                    expected_C = base_C * (1 + int(num_regions))
+                    if int(weight_map.shape[0]) < expected_C:
+                        alpha_eff = 1.0
+                        if not hasattr(training, "_warned_packed_mismatch"):
+                            print(
+                                f"[warn] language_feature_weight_map 通道数={int(weight_map.shape[0])}，"
+                                f"不足以支持 packed local-global（期望 >= {expected_C}）。已退化为 global-only。"
+                            )
+                            training._warned_packed_mismatch = True
                     else:
                         for rid in chosen_rids:
                             start = base_C + int(rid) * base_C
                             end = start + base_C
                             local_slice = weight_map[start:end]
-                            local_feature = local_feature + gaussians.compute_local_layer_feature_map(local_slice, layer_idx, rid)
+                            local_feature = local_feature + gaussians.compute_local_layer_feature_map(local_slice, layer_idx, int(rid))
 
-                    if len(chosen_rids) > 0 and non_empty_region_ids is not None and len(chosen_rids) < len(non_empty_region_ids):
-                        local_feature = local_feature * (float(len(non_empty_region_ids)) / float(len(chosen_rids)))
+                        if len(chosen_rids) > 0 and len(chosen_rids) < len(non_empty_region_ids):
+                            local_feature = local_feature * (float(len(non_empty_region_ids)) / float(len(chosen_rids)))
 
             if profile_this_iter:
                 torch.cuda.synchronize()

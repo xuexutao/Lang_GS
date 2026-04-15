@@ -72,7 +72,8 @@ class Camera(nn.Module):
             self._lf_seg_mmap = np.load(language_feature_name + '_s.npy', mmap_mode='r')
             self._lf_feat_mmap = np.load(language_feature_name + '_f.npy', mmap_mode='r')
             # feature_map is typically small; keep it on GPU for fast indexing.
-            self._lf_feat_gpu = torch.from_numpy(np.asarray(self._lf_feat_mmap)).to(self.data_device)
+            # NOTE: mmap buffer can be non-writable -> copy to avoid PyTorch warning/UB.
+            self._lf_feat_gpu = torch.from_numpy(np.asarray(self._lf_feat_mmap).copy()).to(self.data_device)
 
         lvl = int(feature_level)
         if lvl < 0 or lvl > 3:
